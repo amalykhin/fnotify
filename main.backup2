@@ -1,0 +1,204 @@
+#include <assert.h>
+#include <curl/curl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <tidy/tidybuffio.h>
+#include <tidy/tidy.h>
+
+//#define DEBUG
+#ifdef DEBUG
+#define dump_node(node)\
+		printf("%s %s=%s\n", TidyNodeGetName(node),\
+		tidyAttrName(tidyAttrFirst(node)),\
+		tidyAttrValue(tidyAttrFirst(node)));
+#else 
+#define dump_node(node) ;
+#endif
+
+#define get_next_node(node)\
+		tidyGetNext(node)
+#define get_child_node(node)\
+		tidyGetChild(node)
+#define get_parent_node(node)\
+		tidyGetParent(node)
+typedef TidyDoc    Document;
+typedef TidyNode   Node;
+typedef TidyBuffer Buffer;
+
+typedef struct {
+	char *datetime;
+	char *msg;
+	char *name;
+	char *num;
+} Post;
+
+//typedef struct {
+//	char *bp;
+//	size_t size;
+//} Buffer;
+
+size_t write_data (char *contents, size_t size, size_t nmemb, void *userdata);
+Post *get_posts(Document doc);
+Post *get_post(Document doc, Node node);
+Node get_node_by_attr(Node node, char* attr, char* attr_val);
+void print_post(Post *post);
+void print_thread(Document doc);
+
+
+int main (int argc, char *argv[]) {
+	CURL *handle;
+	CURLcode res;
+	Buffer buf;
+	Document doc;
+	int rc;
+
+	//buf.content = NULL;
+	//buf.size = 0;
+
+	if (argc != 2) {
+		fprintf (stderr, "Usage: 4notify URL\n");
+		return 1;
+	}
+
+	curl_global_init(CURL_GLOBAL_ALL);
+
+	handle = curl_easy_init();
+	curl_easy_setopt(handle, CURLOPT_URL,           argv[1]);
+	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_data);
+	curl_easy_setopt(handle, CURLOPT_WRITEDATA,     &buf);
+	curl_easy_setopt(handle, CURLOPT_USERAGENT,     "libcurl-agent/1.0");
+
+	//buf.bp = NULL;
+	//buf.size = 0;
+	tidyBufInit(&buf);
+	printf("Getting HTML...\n");
+	if ((res = curl_easy_perform(handle)) != CURLE_OK) {
+		fprintf(stderr, "Error: %s\n", curl_easy_strerror(res));
+		return 1;
+	}
+
+	//buf.bp[buf.size] = '\0';
+	//puts(buf.bp);
+
+	curl_easy_cleanup(handle);
+	curl_global_cleanup();
+
+	//doc = xmlParseMemory(buf.bp, buf.size);
+	//if (!doc) {
+	//	fprintf(stderr, "Could not parse the document.\n");
+	//	return 1;
+	//}
+
+	doc = tidyCreate();
+	printf("Parsing...\n");
+	rc = tidyParseBuffer(doc, &buf);
+	if (rc >= 0) {
+		printf("Tidying the markup...\n");
+		rc = tidyCleanAndRepair(doc);
+	}
+	if (rc >= 0) {
+		printf("Dumping the posts...\n");
+		print_thread(doc);
+	}
+
+	tidyBufFree(&buf);
+	tidyRelease(doc);
+	
+	return 0;
+}
+
+size_t 
+write_data (char *contents, size_t size, size_t nmemb, void *userdata) 
+{
+	Buffer *buf = (Buffer *) userdata;
+	size_t rsize = size*nmemb; 
+	static int count = 0;
+
+	assert(rsize != 0);
+	tidyBufAppend(buf, contents, rsize);
+
+	return rsize;
+}
+
+void print_thread(Document doc)
+{
+	Node node;
+	Post *post;
+
+	node = tidyGetBody(doc);
+	node = get_node_by_attr(node, "name",  "delform");
+	node = get_node_by_attr(node, "class", "board");
+	node = get_node_by_attr(node, "class", "thread");
+	node = get_node_by_attr(node, "class", "postContainer opContainer");
+
+	while (node) {
+		post = get_post(doc, node);
+		printf("Name:%s %s #%s\n\t%s", 	post->name, post->datetime,
+					  	post->num,  post->msg);	
+		free (post);
+		node = get_next_node(node);
+	}
+	
+}
+
+Post*
+get_post(Document doc, Node node)
+{
+#define get_node_value(node, var)\
+			tidyNodeGetValue(doc, get_child_node(node), &buf);\
+			var = strndup(buf.bp, buf.size);\
+			tidyBufClear(&buf);
+	Post *post;
+	Buffer buf;
+	Node field;
+
+	tidyBufInit(&buf);
+	post = calloc(1, sizeof(Post));
+	field = node;
+	if (!(node = get_node_by_attr(node, "class", "post reply")))
+		node = get_node_by_attr(field, "class", "post op");
+
+	//Get post info node
+	node = get_node_by_attr(node, "class", "postInfo desktop");
+
+	//Get post name
+	node = get_node_by_attr(node, "class", "nameBlock");
+	field = get_node_by_attr(node, "class", "name");
+	get_node_value(node, post->name);
+	node = get_parent_node(node);
+	
+	//Get post date and time
+	field = get_node_by_attr(node, "class", "dateTime");
+	get_node_value(node, post->datetime);
+
+	//Get post number
+	node = get_node_by_attr(node, "class", "postNum desktop");
+	field = get_node_by_attr(node, "title", "Reply to this post");
+	get_node_value(node, post->num);
+	node = get_parent_node(node);
+	node = get_parent_node(node);
+	
+	//Get post message
+	field = get_node_by_attr(node, "class", "postMessage");	
+	get_node_value(node, post->msg);
+
+	return post;
+#undef get_node_value
+}
+
+Node 
+get_node_by_attr(Node node, char* attr_name, char* attr_val)
+{
+	char *value;
+	TidyAttr attr;
+	for (node = get_child_node(node); node; node = get_next_node(node)) {
+		dump_node(node);
+		for (attr = tidyAttrFirst(node); attr; attr = tidyAttrNext(attr))
+			if (!strcmp(tidyAttrName(attr), attr_name))
+				break;
+		if (attr && !strcmp(tidyAttrValue(attr), attr_val))
+			return node;
+	}
+	return NULL;
+}

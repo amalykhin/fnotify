@@ -1,0 +1,260 @@
+#include <assert.h>
+//#include <tidy/tidy.h>
+//#include <tidy/tidybuffio.h>
+#include <libxml/HTMLparser.h>
+#include <libxml/HTMLtree.h>
+#include <libxml/xpath.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <curl/curl.h>
+
+#define UPD_INTERVAL 100
+
+typedef struct {
+	xmlChar *msg;
+	xmlChar *datetime;
+	xmlChar *name;
+	xmlChar *num;
+} Post;
+
+typedef struct {
+	xmlChar *bp;
+	size_t size;
+} Buffer;
+
+size_t write_data (char *contents, size_t size, size_t nmemb, void *userdata);
+Post *get_posts(xmlDocPtr doc);
+Post *get_post(xmlDocPtr doc, xmlNodePtr node);
+xmlNodePtr get_node_by_attr(xmlNodePtr node, xmlChar* attr, xmlChar* attr_val);
+void print_post(Post *post);
+void print_thread(xmlDocPtr doc);
+void print_new_posts(xmlDocPtr doc);
+
+#define get_node_value(node)\
+	xmlNodeListGetString(doc, node->nodesetval->nodeTab[0]->xmlChildrenNode, 1)
+
+int main (int argc, xmlChar *argv[]) {
+	CURL *handle;
+	CURLcode res;
+	Buffer buf;
+	htmlDocPtr doc;
+	int rc;
+
+	//buf.content = NULL;
+	//buf.size = 0;
+
+	if (argc != 2) {
+		fprintf (stderr, "Usage: 4notify URL\n");
+		return 1;
+	}
+
+	curl_global_init(CURL_GLOBAL_ALL);
+
+	handle = curl_easy_init();
+	curl_easy_setopt(handle, CURLOPT_URL, argv[1]);
+	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_data);
+	curl_easy_setopt(handle, CURLOPT_WRITEDATA, &buf);
+	curl_easy_setopt(handle, CURLOPT_USERAGENT, "libcurl-agent/1.0");
+
+	buf.bp = NULL;
+	buf.size = 0;
+	printf("Getting HTML...\n");
+	if ((res = curl_easy_perform(handle)) != CURLE_OK) {
+		fprintf(stderr, "Error: %s\n", curl_easy_strerror(res));
+		return 1;
+	}
+
+	//buf.bp[buf.size] = '\0';
+	//puts(buf.bp);
+
+	curl_easy_cleanup(handle);
+	curl_global_cleanup();
+
+	doc = htmlReadDoc(buf.bp, NULL, "utf-8", XML_PARSE_NOERROR);
+	if (!doc) {
+		fprintf(stderr, "Could not parse the document.\n");
+		return 1;
+	}
+
+	//doc = tidyCreate();
+	//printf("Parsing...\n");
+	//rc = tidyParseBuffer(doc, &buf);
+	//if (rc >= 0) {
+	//	printf("Tidying the markup...\n");
+	//	rc = tidyCleanAndRepair(doc);
+	//}
+	//if (rc >= 0) {
+	printf("Dumping the posts...\n");
+	while (1) {
+		print_new_posts(doc);
+		sleep(UPD_INTERVAL);
+	}
+	//}
+
+	//tidyBufFree(&buf);
+	//tidyRelease(doc);
+	free(buf.bp);
+	
+	return 0;
+}
+
+void
+print_new_posts (xmlDocPtr doc)
+{
+	xmlXPathContextPtr context;
+	xmlXPathObjectPtr result;
+	static char *last_num = NULL;
+	char path[100];
+	Post *post;
+
+	context = xmlXPathNewContext(doc);
+	if (!last_num) {
+		print_thread(doc);
+		sprintf(path, "//*[@class=\"postContainer replyContainer\" and last()]//*[@class=\"dateTime\"]/attribute::data-utc");
+		result = xmlXPathEvalExpression(path, context);
+		last_num = get_node_value(result);
+		return;
+	}
+
+	sprintf(path, "//*[@class=\"postContainer replyContainer\" and @data-utc>%s]", last_num);
+	result = xmlXPathEvalExpression(path, context);
+	post = calloc(1, sizeof(Post));
+	while(result->nodesetval->nodeNr--) {
+		post = get_post(doc, *result->nodesetval->nodeTab);
+		printf("Name:%s %s #%s\n\t%s\n\n", post->name, post->datetime,
+					  	post->num,  post->msg);	
+		free(post);
+		result->nodesetval->nodeTab++;	
+	}
+
+
+}
+
+size_t 
+write_data (char *contents, size_t size, size_t nmemb, void *userdata) 
+{
+	Buffer *buf = (Buffer *) userdata;
+	size_t rsize = size*nmemb; 
+	static int count = 0;
+
+	assert(rsize != 0);
+	buf->bp = realloc(buf->bp, buf->size+rsize);
+	strncpy(buf->bp+buf->size, contents, rsize);
+	buf->size += rsize;
+
+	return rsize;
+}
+
+void print_thread(xmlDocPtr doc)
+{
+	//xmlNodePtr node;
+	xmlXPathContextPtr context;
+	xmlXPathObjectPtr result;
+	xmlNodeSetPtr nodes;
+	Post *post;
+
+	/*node = xmlDocGetRootElement(doc);
+	assert(node);
+	for (node = node->xmlChildrenNode; node; node = node->next)
+		if (!xmlStrcmp(node->name, "body"))
+			break;
+	node = get_node_by_attr(node, "name", "delform");
+	assert(node);
+	node = get_node_by_attr(node, "class", "board");
+	assert(node);
+	node = get_node_by_attr(node, "class", "thread");
+	assert(node);
+	node = get_node_by_attr(node, "class", "postContainer opContainer");
+	*/
+	context = xmlXPathNewContext(doc);
+	result = xmlXPathEvalExpression("//*[@class=\"postContainer replyContainer\"]", context);
+	nodes = result->nodesetval;	
+
+	while(nodes->nodeNr--) {
+		post = get_post(doc, *nodes->nodeTab);
+		printf("Name:%s %s #%s\n\t%s\n\n", post->name, post->datetime,
+					  	post->num,  post->msg);	
+		free(post);
+		nodes->nodeTab++;	
+	}
+
+	/*while (node) {
+		post = get_post(doc, node);
+		printf("Name:%s %s #%s\n\t%s", post->name, post->datetime,
+					  	post->num,  post->msg);	
+		free (post);
+		node = node->next;
+	}
+	*/	
+}
+
+Post*
+get_post(xmlDocPtr doc, xmlNodePtr node)
+{
+	Post *post;
+	xmlNodePtr field;
+	xmlXPathContextPtr context;
+	xmlXPathObjectPtr result;
+
+	post = calloc(1, sizeof(Post));
+	context = xmlXPathNewContext(doc);
+	xmlXPathSetContextNode(node, context);
+
+	result = xmlXPathEvalExpression(".//*[@class=\"name\"]", context);
+	post->name = xmlNodeListGetString(doc, result->nodesetval->nodeTab[0]->xmlChildrenNode, 1);
+	
+	result = xmlXPathEvalExpression(".//*[@class=\"dateTime\"]", context);
+	post->datetime = xmlNodeListGetString(doc, result->nodesetval->nodeTab[0]->xmlChildrenNode, 1);
+
+	result = xmlXPathEvalExpression(".//*[@title=\"Reply to this post\"]", context);
+	post->num = xmlNodeListGetString(doc, result->nodesetval->nodeTab[0]->xmlChildrenNode, 1);
+
+	result = xmlXPathEvalExpression(".//*[@class=\"postMessage\"]", context);
+	post->msg = xmlNodeListGetString(doc, result->nodesetval->nodeTab[0]->xmlChildrenNode, 1);
+
+	/*field = node;
+	if (!(node = get_node_by_attr(node, "class", "post reply")))
+		node = get_node_by_attr(field, "class", "post op");
+
+	//Get post info node
+	node = get_node_by_attr(node, "class", "postInfo desktop");
+
+	//Get post name
+	node = get_node_by_attr(node, "class", "nameBlock");
+	field = get_node_by_attr(node, "class", "name");
+	post->name = xmlNodeListGetString(doc, field->xmlChildrenNode, 1);
+	node = node->parent;
+	
+	//Get post date and time
+	field = get_node_by_attr(node, "class", "dateTime");
+	post->datetime = xmlNodeListGetString(doc, field->xmlChildrenNode, 1);
+
+	//Get post number
+	node = get_node_by_attr(node, "class", "postNum desktop");
+	field = get_node_by_attr(node, "title", "Reply to this post");
+	post->num = xmlNodeListGetString(doc, field->xmlChildrenNode, 1);
+	node = node->parent;
+	node = node->parent;
+	
+	//Get post message
+	field = get_node_by_attr(node, "class", "postMessage");	
+	post->msg = xmlNodeListGetString(doc, field->xmlChildrenNode, 1);
+	*/
+
+	return post;
+}
+
+xmlNodePtr 
+get_node_by_attr(xmlNodePtr node, xmlChar* attr_name, xmlChar* attr_val)
+{
+	xmlChar *value;
+	assert(node);
+	for (node = node->children; node; node = node->next) {
+		value = xmlGetProp(node, attr_name);
+		if (value && !xmlStrcmp(value, attr_val))
+			return node;
+	}
+	return NULL;
+}
